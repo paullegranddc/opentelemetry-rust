@@ -1,5 +1,5 @@
 use std::borrow::{Borrow, Cow};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::{fmt, hash};
 
 use std::hash::{Hash, Hasher};
@@ -457,9 +457,39 @@ impl Eq for KeyValue {}
 /// See the [instrumentation libraries] spec for more information.
 ///
 /// [instrumentation libraries]: https://github.com/open-telemetry/opentelemetry-specification/blob/v1.9.0/specification/overview.md#instrumentation-libraries
+#[derive(Debug, Clone, Hash, Default)]
+pub struct InstrumentationScope(InstrumentationScopeInner);
+
+#[derive(Debug, Clone)]
+/// inner private enum to hide variants for InstrumentationScope
+///
+/// This enum distinguishes three cases in order of likeliness:
+/// * The instrumentation only has a custom name
+/// * The instrumentation has a custom attributes, version and schema url, but these are static for the lifetime
+/// of the process
+/// * The instrumentation has a custom attributes, version and schema url, but these are dynamically and can change
+/// during process lifetime
+///
+/// This type is embedded in many data structs (like SpanData), and it's state is pretty big (about 100 bytes).
+/// Thus we want to avoid copying it around.
+/// This enum provides a tradeoff where in the 2 most liely cases, this does zero allocations, while reducing
+/// the size of the type to 24 bytes.
+enum InstrumentationScopeInner {
+    Static(&'static InstrumentationScopeState),
+    Dynamic(Arc<InstrumentationScopeState>),
+    /// All values of the instrumentation scope are default, expect the name
+    Named(&'static str),
+}
+
+impl Default for InstrumentationScopeInner {
+    fn default() -> Self {
+        InstrumentationScopeInner::Named("")
+    }
+}
+
+/// InstrumentationScopeState contains a set of attributes that describe an instrumentation scope.
 #[derive(Debug, Default, Clone)]
-#[non_exhaustive]
-pub struct InstrumentationScope {
+pub struct InstrumentationScopeState {
     /// The library name.
     ///
     /// This should be the name of the crate providing the instrumentation.
@@ -479,35 +509,80 @@ pub struct InstrumentationScope {
 
 impl PartialEq for InstrumentationScope {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.version == other.version
-            && self.schema_url == other.schema_url
+        self.name() == other.name()
+            && self.version() == other.version()
+            && self.schema_url() == other.schema_url()
             && {
-                let mut self_attrs = self.attributes.clone();
-                let mut other_attrs = other.attributes.clone();
-                self_attrs.sort_unstable_by(|a, b| a.key.cmp(&b.key));
-                other_attrs.sort_unstable_by(|a, b| a.key.cmp(&b.key));
-                self_attrs == other_attrs
+                let mut self_attrs = self.attributes();
+                let mut other_attrs = other.attributes();
+                let equal_elems = (&mut self_attrs).zip(&mut other_attrs).all(|(s, o)| s == o);
+                let same_length = self_attrs.next().is_none() && other_attrs.next().is_none();
+                equal_elems && same_length
             }
+    }
+}
+
+impl hash::Hash for InstrumentationScopeInner {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            InstrumentationScopeInner::Static(s) => s.hash(state),
+            InstrumentationScopeInner::Dynamic(s) => s.hash(state),
+            InstrumentationScopeInner::Named(name) => {
+                name.hash(state);
+                Hash::hash(&None::<Cow<'static, str>>, state); //version
+                Hash::hash(&None::<Cow<'static, str>>, state); // schema url
+            }
+        }
     }
 }
 
 impl Eq for InstrumentationScope {}
 
-impl hash::Hash for InstrumentationScope {
+impl hash::Hash for InstrumentationScopeState {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
         self.name.hash(state);
         self.version.hash(state);
         self.schema_url.hash(state);
-        let mut sorted_attrs = self.attributes.clone();
-        sorted_attrs.sort_unstable_by(|a, b| a.key.cmp(&b.key));
-        for attribute in sorted_attrs {
+        for attribute in &self.attributes {
             attribute.hash(state);
         }
     }
 }
 
 impl InstrumentationScope {
+    /// Builds a static instrumentation scope.
+    ///
+    /// Most scopes have static  
+    ///
+    /// ```
+    /// use std::sync::OnceLock;
+    /// use opentelemetry::{KeyValue, InstrumentationScope, InstrumentationScopeState};
+    ///
+    /// static INSTRUMENTATION_SCOPE: OnceLock<InstrumentationScopeState> = OnceLock::new();
+    /// let scope = InstrumentationScope::build_static("my_instrumentation", |builder|
+    ///     builder
+    ///         .with_version("1.0.0")
+    ///         .with_attributes([KeyValue::new("k", "v")]),
+    ///     &INSTRUMENTATION_SCOPE,
+    /// );
+    /// ```
+    pub fn build_static<F: FnOnce(InstrumentationScopeBuilder) -> InstrumentationScopeBuilder>(
+        name: &'static str,
+        f: F,
+        cell: &'static OnceLock<InstrumentationScopeState>,
+    ) -> Self {
+        let inner = cell.get_or_init(|| {
+            let builder = f(Self::builder(name));
+            InstrumentationScopeState {
+                name: builder.name,
+                version: builder.version,
+                schema_url: builder.schema_url,
+                attributes: builder.attributes.unwrap_or(Vec::new()),
+            }
+        });
+        InstrumentationScope(InstrumentationScopeInner::Static(inner))
+    }
+
     /// Create a new builder to create an [InstrumentationScope]
     pub fn builder<T: Into<Cow<'static, str>>>(name: T) -> InstrumentationScopeBuilder {
         InstrumentationScopeBuilder {
@@ -521,13 +596,21 @@ impl InstrumentationScope {
     /// Returns the instrumentation library name.
     #[inline]
     pub fn name(&self) -> &str {
-        &self.name
+        match &self.0 {
+            InstrumentationScopeInner::Static(s) => &s.name,
+            InstrumentationScopeInner::Dynamic(s) => &s.name,
+            InstrumentationScopeInner::Named(name) => name,
+        }
     }
 
     /// Returns the instrumentation library version.
     #[inline]
     pub fn version(&self) -> Option<&str> {
-        self.version.as_deref()
+        match &self.0 {
+            InstrumentationScopeInner::Static(s) => s.version.as_deref(),
+            InstrumentationScopeInner::Dynamic(s) => s.version.as_deref(),
+            InstrumentationScopeInner::Named(_) => None,
+        }
     }
 
     /// Returns the [Schema URL] used by this library.
@@ -535,13 +618,22 @@ impl InstrumentationScope {
     /// [Schema URL]: https://github.com/open-telemetry/opentelemetry-specification/blob/v1.9.0/specification/schemas/overview.md#schema-url
     #[inline]
     pub fn schema_url(&self) -> Option<&str> {
-        self.schema_url.as_deref()
+        match &self.0 {
+            InstrumentationScopeInner::Static(s) => s.schema_url.as_deref(),
+            InstrumentationScopeInner::Dynamic(s) => s.schema_url.as_deref(),
+            InstrumentationScopeInner::Named(_) => None,
+        }
     }
 
     /// Returns the instrumentation scope attributes to associate with emitted telemetry.
     #[inline]
     pub fn attributes(&self) -> impl Iterator<Item = &KeyValue> {
-        self.attributes.iter()
+        let attributes: &[_] = match &self.0 {
+            InstrumentationScopeInner::Static(s) => &s.attributes,
+            InstrumentationScopeInner::Dynamic(s) => &s.attributes,
+            InstrumentationScopeInner::Named(_) => &[],
+        };
+        attributes.into_iter()
     }
 }
 
@@ -608,18 +700,27 @@ impl InstrumentationScopeBuilder {
     where
         I: IntoIterator<Item = KeyValue>,
     {
-        self.attributes = Some(attributes.into_iter().collect());
+        let mut attributes: Vec<_> = attributes.into_iter().collect();
+        attributes.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+        self.attributes = Some(attributes);
         self
     }
 
     /// Create a new [InstrumentationScope] from this configuration
     pub fn build(self) -> InstrumentationScope {
-        InstrumentationScope {
-            name: self.name,
-            version: self.version,
-            schema_url: self.schema_url,
-            attributes: self.attributes.unwrap_or_default(),
+        if let Cow::Borrowed(name) = self.name {
+            if self.version.is_none() && self.schema_url.is_none() && self.attributes.is_none() {
+                return InstrumentationScope(InstrumentationScopeInner::Named(name));
+            }
         }
+        InstrumentationScope(InstrumentationScopeInner::Dynamic(Arc::new(
+            InstrumentationScopeState {
+                name: self.name,
+                version: self.version,
+                schema_url: self.schema_url,
+                attributes: self.attributes.unwrap_or_default(),
+            },
+        )))
     }
 }
 
@@ -712,6 +813,37 @@ mod tests {
             .with_schema_url("https://opentelemetry.io/schemas/1.17.0")
             .with_attributes([KeyValue::new("k", "v")])
             .build();
+        static SCOPE_3: std::sync::OnceLock<crate::InstrumentationScopeState> =
+            std::sync::OnceLock::new();
+        let scope3 = InstrumentationScope::build_static(
+            "my-crate",
+            |builder| {
+                builder
+                    .with_version("v0.1.0")
+                    .with_schema_url("https://opentelemetry.io/schemas/1.17.0")
+                    .with_attributes([KeyValue::new("k", "v")])
+            },
+            &SCOPE_3,
+        );
+        assert_eq!(scope1, scope2);
+        assert_eq!(scope2, scope3);
+        assert_eq!(scope3, scope1);
+    }
+
+    #[test]
+    fn instrumentation_scope_equality_name_only() {
+        let scope1 = InstrumentationScope::builder("my-crate").build();
+        let scope2 = InstrumentationScope::builder("my-crate")
+            .with_attributes([])
+            .build();
+        assert!(matches!(
+            &scope1.0,
+            super::InstrumentationScopeInner::Named(_)
+        ));
+        assert!(matches!(
+            &scope2.0,
+            super::InstrumentationScopeInner::Dynamic(_)
+        ));
         assert_eq!(scope1, scope2);
     }
 
@@ -727,14 +859,30 @@ mod tests {
             .with_schema_url("https://opentelemetry.io/schemas/1.17.0")
             .with_attributes([KeyValue::new("k2", "v2"), KeyValue::new("k1", "v1")])
             .build();
+        static SCOPE_3: std::sync::OnceLock<crate::InstrumentationScopeState> =
+            std::sync::OnceLock::new();
+        let scope3 = InstrumentationScope::build_static(
+            "my-crate",
+            |builder| {
+                builder
+                    .with_version("v0.1.0")
+                    .with_schema_url("https://opentelemetry.io/schemas/1.17.0")
+                    .with_attributes([KeyValue::new("k2", "v2"), KeyValue::new("k1", "v1")])
+            },
+            &SCOPE_3,
+        );
         assert_eq!(scope1, scope2);
+        assert_eq!(scope1, scope3);
 
         // assert hash are same for both scopes
         let mut hasher1 = std::collections::hash_map::DefaultHasher::new();
         scope1.hash(&mut hasher1);
         let mut hasher2 = std::collections::hash_map::DefaultHasher::new();
         scope2.hash(&mut hasher2);
+        let mut hasher3 = std::collections::hash_map::DefaultHasher::new();
+        scope3.hash(&mut hasher3);
         assert_eq!(hasher1.finish(), hasher2.finish());
+        assert_eq!(hasher1.finish(), hasher3.finish());
     }
 
     #[test]
@@ -757,5 +905,28 @@ mod tests {
         let mut hasher2 = std::collections::hash_map::DefaultHasher::new();
         scope2.hash(&mut hasher2);
         assert_ne!(hasher1.finish(), hasher2.finish());
+    }
+
+    #[test]
+    fn instrumentation_scope_hash_name_only() {
+        let scope1 = InstrumentationScope::builder("my-crate").build();
+        let scope2 = InstrumentationScope::builder("my-crate")
+            .with_attributes([])
+            .build();
+        assert!(matches!(
+            &scope1.0,
+            super::InstrumentationScopeInner::Named(_)
+        ));
+        assert!(matches!(
+            &scope2.0,
+            super::InstrumentationScopeInner::Dynamic(_)
+        ));
+        assert_eq!(scope1, scope2);
+
+        let mut hasher1 = std::collections::hash_map::DefaultHasher::new();
+        scope1.hash(&mut hasher1);
+        let mut hasher2 = std::collections::hash_map::DefaultHasher::new();
+        scope2.hash(&mut hasher2);
+        assert_eq!(hasher1.finish(), hasher2.finish());
     }
 }
