@@ -213,6 +213,7 @@ impl OtelString {
         }
     }
 
+    #[inline]
     fn from_owned(s: String) -> Self {
         let s = ManuallyDrop::new(s.into_boxed_str());
         unsafe {
@@ -224,6 +225,7 @@ impl OtelString {
         }
     }
 
+    #[inline]
     const fn from_static(s: &'static str) -> Self {
         unsafe {
             Self::from_pointer_tag(
@@ -234,6 +236,7 @@ impl OtelString {
         }
     }
 
+    #[inline]
     fn from_shared(s: Arc<str>) -> Self {
         let s = ManuallyDrop::new(s);
         unsafe {
@@ -245,6 +248,7 @@ impl OtelString {
         }
     }
 
+    #[inline]
     fn from_cow(s: Cow<'static, str>) -> Self {
         match s {
             Cow::Borrowed(s) => Self::from_static(s),
@@ -257,6 +261,7 @@ impl OtelString {
     ///   the underlying memory stay valid until drop is called on this instance
     /// * len must be the length of the associated str
     /// * tag must be the associated tag for the variant that produced the ptr
+    #[inline]
     const unsafe fn from_pointer_tag(ptr: ptr::NonNull<u8>, len: usize, tag: usize) -> Self {
         Self {
             ptr,
@@ -264,7 +269,10 @@ impl OtelString {
         }
     }
 
+    #[inline]
     fn as_str(&self) -> &str {
+        // Safety: ptr is valid for len bytes, and is a valid utf-8 string since it was
+        // created from a str/String/Arc<str>
         unsafe {
             std::str::from_utf8_unchecked(std::slice::from_raw_parts(
                 self.ptr.as_ptr().cast(),
