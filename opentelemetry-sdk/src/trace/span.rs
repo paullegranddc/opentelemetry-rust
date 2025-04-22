@@ -9,7 +9,7 @@
 //! is possible to change its name, set its `Attributes`, and add `Links` and `Events`.
 //! These cannot be changed after the `Span`'s end time has been set.
 use crate::trace::SpanLimits;
-use opentelemetry::trace::{Event, Link, SpanContext, SpanId, SpanKind, Status};
+use opentelemetry::trace::{Event, Link, Span as _, SpanContext, SpanId, SpanKind, Status};
 use opentelemetry::KeyValue;
 use std::borrow::Cow;
 use std::time::SystemTime;
@@ -80,6 +80,12 @@ impl Span {
         self.data
             .as_ref()
             .map(|data| build_export_data(data.clone(), span_context, tracer))
+    }
+
+    /// Returns a read-only view of the span data
+    /// This is None if the span is not recording.
+    pub fn read<'a>(&'a self) -> Option<ReadableSpan<'a>> {
+        Some(ReadableSpan(self.data.as_ref()?))
     }
 }
 
@@ -246,6 +252,61 @@ impl Drop for Span {
     }
 }
 
+/// A `ReadableSpan` is a read-only view of a `Span` that can be used to
+/// access the span's data without modifying it.
+#[derive(Clone, Debug)]
+pub struct ReadableSpan<'a>(&'a SpanData);
+
+impl<'a> ReadableSpan<'a> {
+    pub fn parent_span_id(&self) -> SpanId {
+        self.0.parent_span_id
+    }
+
+    pub fn span_kind(&self) -> SpanKind {
+        self.0.span_kind.clone()
+    }
+
+    pub fn name(&self) -> &str {
+        self.0.name.as_ref()
+    }
+
+    pub fn start_time(&self) -> SystemTime {
+        self.0.start_time
+    }
+
+    pub fn end_time(&self) -> SystemTime {
+        self.0.end_time
+    }
+
+    pub fn attributes(&self) -> &'a [KeyValue] {
+        &self.0.attributes
+    }
+
+    pub fn dropped_attributes_count(&self) -> u32 {
+        self.0.dropped_attributes_count
+    }
+
+    pub fn events(&self) -> &'a [Event] {
+        &self.0.events
+    }
+
+    pub fn dropped_events_count(&self) -> u32 {
+        self.0.events.dropped_count
+    }
+
+    pub fn links(&self) -> &'a [Link] {
+        &self.0.links.links
+    }
+
+    pub fn dropped_links_count(&self) -> u32 {
+        self.0.links.dropped_count
+    }
+
+    pub fn status(&self) -> &Status {
+        &self.0.status
+    }
+}
+
 fn build_export_data(
     data: SpanData,
     span_context: SpanContext,
@@ -276,8 +337,8 @@ mod tests {
         DEFAULT_MAX_ATTRIBUTES_PER_SPAN, DEFAULT_MAX_EVENT_PER_SPAN, DEFAULT_MAX_LINKS_PER_SPAN,
     };
     use crate::trace::{SpanEvents, SpanLinks};
+    use opentelemetry::trace::TracerProvider;
     use opentelemetry::trace::{self, SpanBuilder, TraceFlags, TraceId, Tracer};
-    use opentelemetry::{trace::Span as _, trace::TracerProvider};
     use std::time::Duration;
     use std::vec;
 
