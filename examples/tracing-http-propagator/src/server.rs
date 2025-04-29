@@ -19,7 +19,12 @@ use opentelemetry_sdk::{
 };
 use opentelemetry_semantic_conventions::trace;
 use opentelemetry_stdout::{LogExporter, SpanExporter};
-use std::{convert::Infallible, net::SocketAddr, sync::OnceLock};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{Mutex, OnceLock},
+};
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -83,6 +88,7 @@ async fn router(
         let span = tracer
             .span_builder("router")
             .with_kind(SpanKind::Server)
+            .with_attributes([KeyValue::new("http.route", req.uri().path().to_string())])
             .start_with_context(tracer, &parent_cx);
 
         info!(name = "router", message = "Dispatching request");
@@ -102,6 +108,63 @@ async fn router(
     };
 
     response
+}
+
+#[derive(Debug, Default)]
+struct RouteConcurrencyCounterSpanProcessor(Mutex<HashMap<opentelemetry::Key, usize>>);
+
+impl SpanProcessor for RouteConcurrencyCounterSpanProcessor {
+    fn force_flush(&self) -> OTelSdkResult {
+        Ok(())
+    }
+
+    fn shutdown(&self) -> OTelSdkResult {
+        Ok(())
+    }
+
+    fn on_start(&self, span: &mut opentelemetry_sdk::trace::Span, _cx: &Context) {
+        let Some(read_span) = span.read() else {
+            return;
+        };
+        if !matches!(read_span.span_kind(), SpanKind::Server) {
+            return;
+        }
+        let Some(route) = read_span
+            .attributes()
+            .iter()
+            .find(|kv| kv.key.as_str() == "http.route")
+        else {
+            return;
+        };
+        let mut counts = self.0.lock().unwrap();
+        let count = counts.entry(route.key.clone()).or_default();
+        *count += 1;
+        span.set_attribute(KeyValue::new(
+            "http.route.concurrent_requests",
+            count.to_string(),
+        ));
+    }
+
+    fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
+        if !matches!(span.span_kind, SpanKind::Server) {
+            return;
+        }
+        let Some(route) = span
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "http.route")
+        else {
+            return;
+        };
+        let mut counts = self.0.lock().unwrap();
+        let Some(count) = counts.get_mut(&route.key) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&route.key);
+        }
+    }
 }
 
 /// A custom log processor that enriches LogRecords with baggage attributes.
@@ -161,6 +224,7 @@ fn init_tracer() -> SdkTracerProvider {
     // Setup tracerprovider with stdout exporter
     // that prints the spans to stdout.
     let provider = SdkTracerProvider::builder()
+        .with_span_processor(RouteConcurrencyCounterSpanProcessor::default())
         .with_span_processor(EnrichWithBaggageSpanProcessor)
         .with_simple_exporter(SpanExporter::default())
         .build();
